@@ -1,0 +1,28 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual environments
+.venv/
+.venv_sf/
+venv/
+
+# Tooling / temp
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.DS_Store
+
+# Project outputs and artifacts
+python_r_work/sanitary_flow/output/
+python_r_work/sanitary_flow/output_linux/
+python_r_work/sanitary_flow/**/*.pkl
+python_r_work/sanitary_flow/**/*.xlsx
+python_r_work/sanitary_flow/**/*.png
+
+# Logs
+*.log
