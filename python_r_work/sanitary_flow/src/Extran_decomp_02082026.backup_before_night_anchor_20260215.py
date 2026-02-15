@@ -123,11 +123,6 @@ class Config:
     sh_nrounds_max: int = 3000
     xgb_nthread: int = max(1, (os.cpu_count() or 2) - 1)
     fast_mode: bool = True
-    wee_hours_start: int = 0
-    wee_hours_end: int = 4
-    night_weight_ex: float = 1.30
-    night_weight_sh: float = 1.20
-    night_anchor_alpha: float = 0.35
 
     plots_enable: bool = True
     plots_dpi: int = 120
@@ -829,15 +824,6 @@ def split_days(dates: List[Date], train_frac: float) -> Dict[str, List[Date]]:
     return {"train": d[:n_train], "test": d[n_train:]}
 
 
-def is_wee_hour(hours: np.ndarray, start_hr: int, end_hr: int) -> np.ndarray:
-    h = np.asarray(hours, dtype=int)
-    start_hr = int(start_hr) % 24
-    end_hr = int(end_hr) % 24
-    if start_hr <= end_hr:
-        return (h >= start_hr) & (h <= end_hr)
-    return (h >= start_hr) | (h <= end_hr)
-
-
 # =============================================================================
 # 11) XGB train helper
 # =============================================================================
@@ -850,18 +836,13 @@ def xgb_train_es(
     valid_fraction_rows: float,
     min_valid_rows: int,
     max_train_rows: Optional[int],
-    sample_weight: Optional[np.ndarray] = None,
 ) -> xgb.Booster:
     n = X.shape[0]
     if max_train_rows is not None and n > max_train_rows:
         start = n - max_train_rows
         X = X[start:, :]
         y = y[start:]
-        if sample_weight is not None:
-            sample_weight = np.asarray(sample_weight[start:], dtype=float)
         n = X.shape[0]
-    elif sample_weight is not None:
-        sample_weight = np.asarray(sample_weight, dtype=float)
 
     nva = max(min_valid_rows, int(math.floor(n * valid_fraction_rows)))
     nva = min(nva, max(50, n - 50))
@@ -869,10 +850,8 @@ def xgb_train_es(
     tr_idx = np.arange(0, n - nva)
     va_idx = np.arange(n - nva, n)
 
-    wtr = None if sample_weight is None else sample_weight[tr_idx]
-    wva = None if sample_weight is None else sample_weight[va_idx]
-    dtr = xgb.DMatrix(X[tr_idx, :], label=y[tr_idx], weight=wtr)
-    dva = xgb.DMatrix(X[va_idx, :], label=y[va_idx], weight=wva)
+    dtr = xgb.DMatrix(X[tr_idx, :], label=y[tr_idx])
+    dva = xgb.DMatrix(X[va_idx, :], label=y[va_idx])
 
     booster = xgb.train(
         params=params,
@@ -914,8 +893,6 @@ def fit_dry_decomposition_models(hourly: pd.DataFrame, daily_all: pd.DataFrame, 
     split = split_days(dry_days, cfg.train_fraction_days)
     dt_train = dt[dt["date"].isin(split["train"])].copy()
     dt_test = dt[dt["date"].isin(split["test"])].copy()
-    dt_train["hour"] = dt_train["datetime"].dt.hour.astype(int)
-    dt_test["hour"] = dt_test["datetime"].dt.hour.astype(int)
 
     dt_train["s_shape"] = 1.0
     dt_test["s_shape"] = 1.0
@@ -934,18 +911,6 @@ def fit_dry_decomposition_models(hourly: pd.DataFrame, daily_all: pd.DataFrame, 
     dmx_ex_train = xgb.DMatrix(Xex_train)
     dmx_sh_train = xgb.DMatrix(Xsh_train)
     dt_train_dates = dt_train["date"].to_numpy()
-    train_hours = dt_train["hour"].to_numpy(dtype=int)
-    night_mask_train = is_wee_hour(train_hours, cfg.wee_hours_start, cfg.wee_hours_end)
-    w_ex = np.where(night_mask_train, float(cfg.night_weight_ex), 1.0).astype(float)
-    w_sh = np.where(night_mask_train, float(cfg.night_weight_sh), 1.0).astype(float)
-    prior_hour_shape = (
-        dt_train.assign(day_mean=dt_train.groupby("date")["plant_flow"].transform("mean"))
-        .assign(rel=lambda z: np.where(z["day_mean"] > 0, z["plant_flow"] / z["day_mean"], 1.0))
-        .groupby("hour")["rel"].median()
-    )
-    prior_hour_shape = prior_hour_shape.reindex(range(24)).interpolate(limit_direction="both").fillna(1.0)
-    prior_hour_shape = prior_hour_shape / max(1e-9, float(prior_hour_shape.mean()))
-    prior_hour_map = prior_hour_shape.to_dict()
     best_rmse = float("inf")
     no_improve = 0
 
@@ -968,8 +933,7 @@ def fit_dry_decomposition_models(hourly: pd.DataFrame, daily_all: pd.DataFrame, 
             early_stopping_rounds=cfg.early_stopping_rounds,
             valid_fraction_rows=cfg.valid_fraction_rows,
             min_valid_rows=cfg.min_valid_rows,
-            max_train_rows=cfg.max_train_rows,
-            sample_weight=w_ex,
+            max_train_rows=cfg.max_train_rows
         )
 
         ex_pred_raw = np.maximum(0.0, ex_model.predict(dmx_ex_train))
@@ -982,12 +946,6 @@ def fit_dry_decomposition_models(hourly: pd.DataFrame, daily_all: pd.DataFrame, 
         dt_train["san_resid"] = san_resid
         san_mean = dt_train.groupby("date")["san_resid"].transform("mean").to_numpy(dtype=float)
         dt_train["san_shape_obs"] = np.where(san_mean > 0, san_resid / san_mean, 1.0)
-        night_shape_prior = dt_train["hour"].map(prior_hour_map).to_numpy(dtype=float)
-        dt_train["san_shape_obs"] = np.where(
-            night_mask_train,
-            (1.0 - cfg.night_anchor_alpha) * dt_train["san_shape_obs"].to_numpy(dtype=float) + cfg.night_anchor_alpha * night_shape_prior,
-            dt_train["san_shape_obs"].to_numpy(dtype=float),
-        )
 
         ysh = dt_train["san_shape_obs"].to_numpy(dtype=float)
 
@@ -998,8 +956,7 @@ def fit_dry_decomposition_models(hourly: pd.DataFrame, daily_all: pd.DataFrame, 
             early_stopping_rounds=cfg.early_stopping_rounds,
             valid_fraction_rows=cfg.valid_fraction_rows,
             min_valid_rows=cfg.min_valid_rows,
-            max_train_rows=cfg.max_train_rows,
-            sample_weight=w_sh,
+            max_train_rows=cfg.max_train_rows
         )
 
         dt_train["s_shape"] = normalize_shape_by_day(dt_train_dates, sh_model.predict(dmx_sh_train))
@@ -1030,44 +987,22 @@ def fit_dry_decomposition_models(hourly: pd.DataFrame, daily_all: pd.DataFrame, 
     dt_test["extraneous_pred"] = np.maximum(0.0, np.where(ex_pred_mean_t > 0, ex_raw_t * (dt_test["extraneous_daily"].to_numpy(dtype=float) / ex_pred_mean_t), 0.0))
     dt_test["plant_recon"] = dt_test["sanitary_pred"] + dt_test["extraneous_pred"]
 
-    def calc_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Tuple[float, float, float]:
-        mae_v = float(np.mean(np.abs(y_true - y_pred)))
-        rmse_v = float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
-        denom_v = float(np.sum((y_true - np.mean(y_true)) ** 2))
-        r2_v = float(1.0 - (np.sum((y_true - y_pred) ** 2) / denom_v)) if denom_v > 0 else float("nan")
-        return mae_v, rmse_v, r2_v
-
-    y_all = dt_test["plant_flow"].to_numpy(dtype=float)
-    yhat_all = dt_test["plant_recon"].to_numpy(dtype=float)
-    mae, rmse, r2 = calc_metrics(y_all, yhat_all)
-    night_mask_test = is_wee_hour(dt_test["hour"].to_numpy(dtype=int), cfg.wee_hours_start, cfg.wee_hours_end)
-    day_mask_test = ~night_mask_test
-    mae_n, rmse_n, r2_n = calc_metrics(y_all[night_mask_test], yhat_all[night_mask_test]) if int(night_mask_test.sum()) > 10 else (float("nan"), float("nan"), float("nan"))
-    mae_d, rmse_d, r2_d = calc_metrics(y_all[day_mask_test], yhat_all[day_mask_test]) if int(day_mask_test.sum()) > 10 else (float("nan"), float("nan"), float("nan"))
+    mae = float(np.mean(np.abs(dt_test["plant_flow"] - dt_test["plant_recon"])))
+    rmse = float(np.sqrt(np.mean((dt_test["plant_flow"] - dt_test["plant_recon"]) ** 2)))
+    denom = float(np.sum((dt_test["plant_flow"] - dt_test["plant_flow"].mean()) ** 2))
+    r2 = float(1.0 - (np.sum((dt_test["plant_flow"] - dt_test["plant_recon"]) ** 2) / denom)) if denom > 0 else float("nan")
 
     print("\n  DRY TEST PERFORMANCE (holdout dry days):")
     print(f"    Plant recon MAE:  {mae:.4f} MGD")
     print(f"    Plant recon RMSE: {rmse:.4f} MGD")
     print(f"    Plant recon R2:   {r2:.4f}")
-    print(f"    Night ({cfg.wee_hours_start:02d}:00-{cfg.wee_hours_end:02d}:59) MAE/RMSE/R2: {mae_n:.4f} / {rmse_n:.4f} / {r2_n:.4f}")
-    print(f"    Day   (other hrs) MAE/RMSE/R2: {mae_d:.4f} / {rmse_d:.4f} / {r2_d:.4f}")
 
     return {
         "ex_model": ex_model,
         "sh_model": sh_model,
         "ex_feature_cols": ex_cols,
         "sh_feature_cols": sh_cols,
-        "dry_test_metrics": {
-            "plant_MAE": mae,
-            "plant_RMSE": rmse,
-            "plant_R2": r2,
-            "night_MAE": mae_n,
-            "night_RMSE": rmse_n,
-            "night_R2": r2_n,
-            "day_MAE": mae_d,
-            "day_RMSE": rmse_d,
-            "day_R2": r2_d,
-        },
+        "dry_test_metrics": {"plant_MAE": mae, "plant_RMSE": rmse, "plant_R2": r2},
         "split": split,
         "dt_test": dt_test,
     }
@@ -1358,11 +1293,6 @@ def export_excel(out_dir: str, dt_final: pd.DataFrame, daily_all: pd.DataFrame, 
         ("ex_nrounds_max", cfg.ex_nrounds_max),
         ("sh_nrounds_max", cfg.sh_nrounds_max),
         ("xgb_nthread", cfg.xgb_nthread),
-        ("wee_hours_start", cfg.wee_hours_start),
-        ("wee_hours_end", cfg.wee_hours_end),
-        ("night_weight_ex", cfg.night_weight_ex),
-        ("night_weight_sh", cfg.night_weight_sh),
-        ("night_anchor_alpha", cfg.night_anchor_alpha),
         ("valid_fraction_rows", cfg.valid_fraction_rows),
         ("max_train_rows", "NULL" if cfg.max_train_rows is None else str(cfg.max_train_rows)),
         ("dry_days_train", len(models["split"]["train"])),
@@ -1398,11 +1328,6 @@ def save_model_bundle(out_dir: str, cfg: Config, lag_opt: int, rf_table: pd.Data
             "ex_nrounds_max": cfg.ex_nrounds_max,
             "sh_nrounds_max": cfg.sh_nrounds_max,
             "xgb_nthread": cfg.xgb_nthread,
-            "wee_hours_start": cfg.wee_hours_start,
-            "wee_hours_end": cfg.wee_hours_end,
-            "night_weight_ex": cfg.night_weight_ex,
-            "night_weight_sh": cfg.night_weight_sh,
-            "night_anchor_alpha": cfg.night_anchor_alpha,
             "valid_fraction_rows": cfg.valid_fraction_rows,
             "min_valid_rows": cfg.min_valid_rows,
             "max_train_rows": cfg.max_train_rows,
@@ -1519,11 +1444,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--early_stopping_rounds", type=int, default=None, help="Override XGBoost early stopping rounds")
     p.add_argument("--max_train_rows", type=int, default=None, help="Override max rows used for XGBoost training")
     p.add_argument("--xgb_nthread", type=int, default=None, help="Override XGBoost nthread")
-    p.add_argument("--wee_hours_start", type=int, default=None, help="Start hour for wee-hours prior/weighting")
-    p.add_argument("--wee_hours_end", type=int, default=None, help="End hour for wee-hours prior/weighting")
-    p.add_argument("--night_weight_ex", type=float, default=None, help="Extra loss weight for wee hours in extraneous model")
-    p.add_argument("--night_weight_sh", type=float, default=None, help="Extra loss weight for wee hours in sanitary shape model")
-    p.add_argument("--night_anchor_alpha", type=float, default=None, help="Blend strength toward wee-hour sanitary prior (0..1)")
     return p.parse_args()
 
 
@@ -1571,22 +1491,6 @@ if __name__ == "__main__":
         if int(args.xgb_nthread) < 1:
             raise ValueError("--xgb_nthread must be >= 1")
         cfg.xgb_nthread = int(args.xgb_nthread)
-    if args.wee_hours_start is not None:
-        cfg.wee_hours_start = int(args.wee_hours_start) % 24
-    if args.wee_hours_end is not None:
-        cfg.wee_hours_end = int(args.wee_hours_end) % 24
-    if args.night_weight_ex is not None:
-        if float(args.night_weight_ex) < 1.0:
-            raise ValueError("--night_weight_ex must be >= 1.0")
-        cfg.night_weight_ex = float(args.night_weight_ex)
-    if args.night_weight_sh is not None:
-        if float(args.night_weight_sh) < 1.0:
-            raise ValueError("--night_weight_sh must be >= 1.0")
-        cfg.night_weight_sh = float(args.night_weight_sh)
-    if args.night_anchor_alpha is not None:
-        if not (0.0 <= float(args.night_anchor_alpha) <= 1.0):
-            raise ValueError("--night_anchor_alpha must be between 0 and 1")
-        cfg.night_anchor_alpha = float(args.night_anchor_alpha)
 
     # ensure xgb seeds match chosen seed
     cfg.xgb_ex_params["seed"] = cfg.seed
