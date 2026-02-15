@@ -110,12 +110,19 @@ class Config:
     tidal_lag_hours: Optional[int] = None
 
     em_iters: int = 6
+    em_min_iters: int = 2
+    em_patience: int = 2
+    em_rmse_tol: float = 0.005
     train_fraction_days: float = 0.75
 
     early_stopping_rounds: int = 80
     valid_fraction_rows: float = 0.10
     min_valid_rows: int = 500
     max_train_rows: Optional[int] = 200000
+    ex_nrounds_max: int = 4000
+    sh_nrounds_max: int = 3000
+    xgb_nthread: int = max(1, (os.cpu_count() or 2) - 1)
+    fast_mode: bool = True
 
     plots_enable: bool = True
     plots_dpi: int = 120
@@ -163,6 +170,7 @@ def make_default_config() -> Config:
         objective="reg:squarederror",
         eval_metric="rmse",
         tree_method="hist",
+        nthread=cfg.xgb_nthread,
         seed=cfg.seed,
     )
     cfg.xgb_sh_params = dict(
@@ -176,6 +184,7 @@ def make_default_config() -> Config:
         objective="reg:squarederror",
         eval_metric="rmse",
         tree_method="hist",
+        nthread=cfg.xgb_nthread,
         seed=cfg.seed,
     )
     return cfg
@@ -767,10 +776,13 @@ def build_ex_features(df: pd.DataFrame, lag_opt: int) -> List[str]:
     tide_prev = np.roll(tide, 1); tide_prev[0] = np.nan
     d["tide_rate"] = tide - tide_prev
 
-    d["tide_range_12h"] = pd.Series(tide).rolling(12, min_periods=1).apply(lambda z: float(np.nanmax(z) - np.nanmin(z))).to_numpy()
-    d["tide_range_24h"] = pd.Series(tide).rolling(24, min_periods=1).apply(lambda z: float(np.nanmax(z) - np.nanmin(z))).to_numpy()
-    d["tide_mean_24h"] = pd.Series(tide).rolling(24, min_periods=1).mean().to_numpy()
-    d["tide_mean_48h"] = pd.Series(tide).rolling(48, min_periods=1).mean().to_numpy()
+    tide_s = pd.Series(tide)
+    roll12 = tide_s.rolling(12, min_periods=1)
+    roll24 = tide_s.rolling(24, min_periods=1)
+    d["tide_range_12h"] = (roll12.max() - roll12.min()).to_numpy()
+    d["tide_range_24h"] = (roll24.max() - roll24.min()).to_numpy()
+    d["tide_mean_24h"] = roll24.mean().to_numpy()
+    d["tide_mean_48h"] = tide_s.rolling(48, min_periods=1).mean().to_numpy()
 
     ts = d["datetime"]
     month = ts.dt.month.astype(float)
@@ -888,12 +900,19 @@ def fit_dry_decomposition_models(hourly: pd.DataFrame, daily_all: pd.DataFrame, 
     ex_model = None
     sh_model = None
 
-    def predict_shape_factor(model: xgb.Booster, dframe: pd.DataFrame) -> np.ndarray:
-        raw = model.predict(xgb.DMatrix(dframe[sh_cols].to_numpy(dtype=float)))
+    def normalize_shape_by_day(dates: np.ndarray, raw: np.ndarray) -> np.ndarray:
         raw = np.maximum(1e-9, raw)
-        tmp = pd.DataFrame({"date": dframe["date"].to_numpy(), "raw": raw})
+        tmp = pd.DataFrame({"date": dates, "raw": raw})
         day_mean = tmp.groupby("date")["raw"].transform("mean").to_numpy()
         return raw / np.maximum(1e-9, day_mean)
+
+    Xex_train = dt_train[ex_cols].to_numpy(dtype=np.float32, copy=False)
+    Xsh_train = dt_train[sh_cols].to_numpy(dtype=np.float32, copy=False)
+    dmx_ex_train = xgb.DMatrix(Xex_train)
+    dmx_sh_train = xgb.DMatrix(Xsh_train)
+    dt_train_dates = dt_train["date"].to_numpy()
+    best_rmse = float("inf")
+    no_improve = 0
 
     for it in range(1, cfg.em_iters + 1):
         print(f"  Iteration {it} / {cfg.em_iters} ({100.0 * it / cfg.em_iters:.0f}%)")
@@ -905,20 +924,19 @@ def fit_dry_decomposition_models(hourly: pd.DataFrame, daily_all: pd.DataFrame, 
         scale = np.where(ex_raw_mean > 0, dt_train["extraneous_daily"].to_numpy(dtype=float) / ex_raw_mean, 0.0)
         dt_train["ex_target"] = np.maximum(0.0, dt_train["ex_target_raw"].to_numpy(dtype=float) * scale)
 
-        Xex = dt_train[ex_cols].to_numpy(dtype=float)
         yex = dt_train["ex_target"].to_numpy(dtype=float)
 
         ex_model = xgb_train_es(
-            X=Xex, y=yex,
+            X=Xex_train, y=yex,
             params=cfg.xgb_ex_params,
-            nrounds_max=4000,
+            nrounds_max=cfg.ex_nrounds_max,
             early_stopping_rounds=cfg.early_stopping_rounds,
             valid_fraction_rows=cfg.valid_fraction_rows,
             min_valid_rows=cfg.min_valid_rows,
             max_train_rows=cfg.max_train_rows
         )
 
-        ex_pred_raw = np.maximum(0.0, ex_model.predict(xgb.DMatrix(Xex)))
+        ex_pred_raw = np.maximum(0.0, ex_model.predict(dmx_ex_train))
         dt_train["ex_pred_raw"] = ex_pred_raw
         ex_pred_mean = dt_train.groupby("date")["ex_pred_raw"].transform("mean").to_numpy(dtype=float)
         ex_pred = np.where(ex_pred_mean > 0, ex_pred_raw * (dt_train["extraneous_daily"].to_numpy(dtype=float) / ex_pred_mean), 0.0)
@@ -929,31 +947,40 @@ def fit_dry_decomposition_models(hourly: pd.DataFrame, daily_all: pd.DataFrame, 
         san_mean = dt_train.groupby("date")["san_resid"].transform("mean").to_numpy(dtype=float)
         dt_train["san_shape_obs"] = np.where(san_mean > 0, san_resid / san_mean, 1.0)
 
-        Xsh = dt_train[sh_cols].to_numpy(dtype=float)
         ysh = dt_train["san_shape_obs"].to_numpy(dtype=float)
 
         sh_model = xgb_train_es(
-            X=Xsh, y=ysh,
+            X=Xsh_train, y=ysh,
             params=cfg.xgb_sh_params,
-            nrounds_max=3000,
+            nrounds_max=cfg.sh_nrounds_max,
             early_stopping_rounds=cfg.early_stopping_rounds,
             valid_fraction_rows=cfg.valid_fraction_rows,
             min_valid_rows=cfg.min_valid_rows,
             max_train_rows=cfg.max_train_rows
         )
 
-        dt_train["s_shape"] = predict_shape_factor(sh_model, dt_train)
+        dt_train["s_shape"] = normalize_shape_by_day(dt_train_dates, sh_model.predict(dmx_sh_train))
 
         sanitary_pred = np.maximum(0.0, dt_train["sanitary_daily"].to_numpy(dtype=float) * dt_train["s_shape"].to_numpy(dtype=float))
         plant_recon = sanitary_pred + dt_train["ex_pred"].to_numpy(dtype=float)
         rmse = float(np.sqrt(np.mean((dt_train["plant_flow"].to_numpy(dtype=float) - plant_recon) ** 2)))
         print(f"    Train recon RMSE (plant): {rmse:.4f} MGD")
+        if rmse + cfg.em_rmse_tol < best_rmse:
+            best_rmse = rmse
+            no_improve = 0
+        else:
+            no_improve += 1
+        if it >= cfg.em_min_iters and no_improve >= cfg.em_patience:
+            print(f"    Early stop EM: no RMSE improvement > {cfg.em_rmse_tol:.4f} for {cfg.em_patience} iterations.")
+            break
 
     # Holdout test
-    dt_test["s_shape"] = predict_shape_factor(sh_model, dt_test)
+    Xsh_test = dt_test[sh_cols].to_numpy(dtype=np.float32, copy=False)
+    dmx_sh_test = xgb.DMatrix(Xsh_test)
+    dt_test["s_shape"] = normalize_shape_by_day(dt_test["date"].to_numpy(), sh_model.predict(dmx_sh_test))
     dt_test["sanitary_pred"] = np.maximum(0.0, dt_test["sanitary_daily"].to_numpy(dtype=float) * dt_test["s_shape"].to_numpy(dtype=float))
 
-    Xex_t = dt_test[ex_cols].to_numpy(dtype=float)
+    Xex_t = dt_test[ex_cols].to_numpy(dtype=np.float32, copy=False)
     ex_raw_t = np.maximum(0.0, ex_model.predict(xgb.DMatrix(Xex_t)))
     dt_test["ex_pred_raw"] = ex_raw_t
     ex_pred_mean_t = dt_test.groupby("date")["ex_pred_raw"].transform("mean").to_numpy(dtype=float)
@@ -1005,13 +1032,15 @@ def apply_models_all_hours(hourly: pd.DataFrame, daily_all: pd.DataFrame, daily_
     ex_model: xgb.Booster = models["ex_model"]
     sh_model: xgb.Booster = models["sh_model"]
 
-    sh_raw = np.maximum(1e-9, sh_model.predict(xgb.DMatrix(dt[sh_cols].to_numpy(dtype=float))))
+    Xsh_all = dt[sh_cols].to_numpy(dtype=np.float32, copy=False)
+    sh_raw = np.maximum(1e-9, sh_model.predict(xgb.DMatrix(Xsh_all)))
     tmp = pd.DataFrame({"date": dt["date"].to_numpy(), "raw": sh_raw})
     day_mean = tmp.groupby("date")["raw"].transform("mean").to_numpy(dtype=float)
     dt["sanitary_shape"] = sh_raw / np.maximum(1e-9, day_mean)
     dt["sanitary_hourly_pred"] = np.maximum(0.0, dt["sanitary_daily"].to_numpy(dtype=float) * dt["sanitary_shape"].to_numpy(dtype=float))
 
-    ex_raw = np.maximum(0.0, ex_model.predict(xgb.DMatrix(dt[ex_cols].to_numpy(dtype=float))))
+    Xex_all = dt[ex_cols].to_numpy(dtype=np.float32, copy=False)
+    ex_raw = np.maximum(0.0, ex_model.predict(xgb.DMatrix(Xex_all)))
     dt["extraneous_baseline_raw"] = ex_raw
     dt["extraneous_hourly_pred"] = ex_raw.astype(np.float64, copy=True)
 
@@ -1255,8 +1284,15 @@ def export_excel(out_dir: str, dt_final: pd.DataFrame, daily_all: pd.DataFrame, 
         ("rf_bounds_secondary", f"{cfg.rf_bounds_secondary[0]}–{cfg.rf_bounds_secondary[1]}"),
         ("travel_time_same_day_fraction", cfg.travel_time_same_day_fraction),
         ("gw_proxy_rolling_days", cfg.gw_proxy_rolling_days),
+        ("fast_mode", int(cfg.fast_mode)),
         ("em_iterations", cfg.em_iters),
+        ("em_min_iters", cfg.em_min_iters),
+        ("em_patience", cfg.em_patience),
+        ("em_rmse_tol", cfg.em_rmse_tol),
         ("early_stopping_rounds", cfg.early_stopping_rounds),
+        ("ex_nrounds_max", cfg.ex_nrounds_max),
+        ("sh_nrounds_max", cfg.sh_nrounds_max),
+        ("xgb_nthread", cfg.xgb_nthread),
         ("valid_fraction_rows", cfg.valid_fraction_rows),
         ("max_train_rows", "NULL" if cfg.max_train_rows is None else str(cfg.max_train_rows)),
         ("dry_days_train", len(models["split"]["train"])),
@@ -1282,9 +1318,16 @@ def save_model_bundle(out_dir: str, cfg: Config, lag_opt: int, rf_table: pd.Data
             "rf_bounds_secondary": cfg.rf_bounds_secondary,
             "travel_time_same_day_fraction": cfg.travel_time_same_day_fraction,
             "gw_proxy_rolling_days": cfg.gw_proxy_rolling_days,
+            "fast_mode": cfg.fast_mode,
             "dwf_filter": cfg.dwf_filter,
             "em_iters": cfg.em_iters,
+            "em_min_iters": cfg.em_min_iters,
+            "em_patience": cfg.em_patience,
+            "em_rmse_tol": cfg.em_rmse_tol,
             "early_stopping_rounds": cfg.early_stopping_rounds,
+            "ex_nrounds_max": cfg.ex_nrounds_max,
+            "sh_nrounds_max": cfg.sh_nrounds_max,
+            "xgb_nthread": cfg.xgb_nthread,
             "valid_fraction_rows": cfg.valid_fraction_rows,
             "min_valid_rows": cfg.min_valid_rows,
             "max_train_rows": cfg.max_train_rows,
@@ -1396,6 +1439,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--usage_units", default="AUTO", help="AUTO | MGD | MG")
     p.add_argument("--plots", type=int, default=1, help="1 enable plots, 0 disable")
+    p.add_argument("--fast", type=int, default=1, help="1 enable faster training mode (default), 0 for full mode")
+    p.add_argument("--em_iters", type=int, default=None, help="Override EM iterations")
+    p.add_argument("--early_stopping_rounds", type=int, default=None, help="Override XGBoost early stopping rounds")
+    p.add_argument("--max_train_rows", type=int, default=None, help="Override max rows used for XGBoost training")
+    p.add_argument("--xgb_nthread", type=int, default=None, help="Override XGBoost nthread")
     return p.parse_args()
 
 
@@ -1417,8 +1465,37 @@ if __name__ == "__main__":
         raise ValueError("--plots must be 0 or 1")
     cfg.plots_enable = bool(int(args.plots))
 
+    if int(args.fast) not in (0, 1):
+        raise ValueError("--fast must be 0 or 1")
+    cfg.fast_mode = bool(int(args.fast))
+    if cfg.fast_mode:
+        cfg.em_iters = min(cfg.em_iters, 4)
+        cfg.early_stopping_rounds = min(cfg.early_stopping_rounds, 40)
+        cfg.ex_nrounds_max = min(cfg.ex_nrounds_max, 2000)
+        cfg.sh_nrounds_max = min(cfg.sh_nrounds_max, 1500)
+        cfg.max_train_rows = 120000 if cfg.max_train_rows is None else min(cfg.max_train_rows, 120000)
+
+    if args.em_iters is not None:
+        if int(args.em_iters) < 1:
+            raise ValueError("--em_iters must be >= 1")
+        cfg.em_iters = int(args.em_iters)
+    if args.early_stopping_rounds is not None:
+        if int(args.early_stopping_rounds) < 1:
+            raise ValueError("--early_stopping_rounds must be >= 1")
+        cfg.early_stopping_rounds = int(args.early_stopping_rounds)
+    if args.max_train_rows is not None:
+        if int(args.max_train_rows) < 1000:
+            raise ValueError("--max_train_rows must be >= 1000")
+        cfg.max_train_rows = int(args.max_train_rows)
+    if args.xgb_nthread is not None:
+        if int(args.xgb_nthread) < 1:
+            raise ValueError("--xgb_nthread must be >= 1")
+        cfg.xgb_nthread = int(args.xgb_nthread)
+
     # ensure xgb seeds match chosen seed
     cfg.xgb_ex_params["seed"] = cfg.seed
     cfg.xgb_sh_params["seed"] = cfg.seed
+    cfg.xgb_ex_params["nthread"] = cfg.xgb_nthread
+    cfg.xgb_sh_params["nthread"] = cfg.xgb_nthread
 
     main(cfg)
