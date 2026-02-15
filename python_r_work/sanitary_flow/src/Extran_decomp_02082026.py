@@ -28,6 +28,7 @@ import argparse
 from dataclasses import dataclass
 from datetime import date as Date
 from datetime import datetime
+from datetime import timezone
 from typing import Dict, Any, Tuple, List, Optional
 
 import numpy as np
@@ -37,6 +38,11 @@ try:
     import xgboost as xgb
 except Exception as e:
     raise ImportError("xgboost is required. Install with: pip install xgboost") from e
+
+try:
+    from catboost import CatBoostRegressor
+except Exception:
+    CatBoostRegressor = None
 
 try:
     from openpyxl import Workbook
@@ -123,6 +129,7 @@ class Config:
     sh_nrounds_max: int = 3000
     xgb_nthread: int = max(1, (os.cpu_count() or 2) - 1)
     fast_mode: bool = True
+    model_backend: str = "xgb"
     wee_hours_start: int = 0
     wee_hours_end: int = 4
     night_weight_ex: float = 1.30
@@ -138,6 +145,8 @@ class Config:
 
     xgb_ex_params: Dict[str, Any] = None
     xgb_sh_params: Dict[str, Any] = None
+    cat_ex_params: Dict[str, Any] = None
+    cat_sh_params: Dict[str, Any] = None
 
 
 def make_default_config() -> Config:
@@ -191,6 +200,30 @@ def make_default_config() -> Config:
         tree_method="hist",
         nthread=cfg.xgb_nthread,
         seed=cfg.seed,
+    )
+    cfg.cat_ex_params = dict(
+        depth=8,
+        learning_rate=0.05,
+        loss_function="RMSE",
+        eval_metric="RMSE",
+        l2_leaf_reg=3.0,
+        random_strength=1.0,
+        bootstrap_type="Bernoulli",
+        subsample=0.8,
+        thread_count=cfg.xgb_nthread,
+        random_seed=cfg.seed,
+    )
+    cfg.cat_sh_params = dict(
+        depth=6,
+        learning_rate=0.06,
+        loss_function="RMSE",
+        eval_metric="RMSE",
+        l2_leaf_reg=3.0,
+        random_strength=1.0,
+        bootstrap_type="Bernoulli",
+        subsample=0.8,
+        thread_count=cfg.xgb_nthread,
+        random_seed=cfg.seed,
     )
     return cfg
 
@@ -357,6 +390,8 @@ def init_output_dirs(cfg: Config) -> Dict[str, str]:
     manifest = {
         "run_ts": run_ts,
         "seed": cfg.seed,
+        "model_backend": cfg.model_backend,
+        "fast_mode": cfg.fast_mode,
         "data_dir": os.path.abspath(cfg.data_dir),
         "results_dir": out_dir,
     }
@@ -364,6 +399,38 @@ def init_output_dirs(cfg: Config) -> Dict[str, str]:
         json.dump(manifest, f, indent=2)
 
     return {"out_dir": out_dir, "run_ts": run_ts}
+
+
+def append_experiment_log(cfg: Config, out_dir: str, run_ts: str, elapsed_sec: float, models: Dict[str, Any]):
+    metrics = models.get("dry_test_metrics", {}) if isinstance(models, dict) else {}
+    row = {
+        "run_ts": run_ts,
+        "timestamp_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        "model_backend": cfg.model_backend,
+        "fast_mode": int(cfg.fast_mode),
+        "seed": cfg.seed,
+        "em_iters": cfg.em_iters,
+        "early_stopping_rounds": cfg.early_stopping_rounds,
+        "max_train_rows": -1 if cfg.max_train_rows is None else int(cfg.max_train_rows),
+        "xgb_nthread": cfg.xgb_nthread,
+        "wee_hours_start": cfg.wee_hours_start,
+        "wee_hours_end": cfg.wee_hours_end,
+        "night_weight_ex": cfg.night_weight_ex,
+        "night_weight_sh": cfg.night_weight_sh,
+        "night_anchor_alpha": cfg.night_anchor_alpha,
+        "elapsed_sec": float(elapsed_sec),
+        "output_dir": out_dir,
+    }
+    for k, v in metrics.items():
+        row[f"metric_{k}"] = v
+
+    log_path = os.path.join(os.path.abspath(cfg.results_parent_dir), "experiment_log.csv")
+    df = pd.DataFrame([row])
+    if os.path.exists(log_path):
+        prev = pd.read_csv(log_path)
+        df = pd.concat([prev, df], ignore_index=True)
+    df.to_csv(log_path, index=False)
+    print(f"  Logged experiment row: {log_path}")
 
 
 # =============================================================================
@@ -841,17 +908,19 @@ def is_wee_hour(hours: np.ndarray, start_hr: int, end_hr: int) -> np.ndarray:
 # =============================================================================
 # 11) XGB train helper
 # =============================================================================
-def xgb_train_es(
+def train_regressor_es(
     X: np.ndarray,
     y: np.ndarray,
-    params: Dict[str, Any],
+    backend: str,
+    params_xgb: Dict[str, Any],
+    params_cat: Dict[str, Any],
     nrounds_max: int,
     early_stopping_rounds: int,
     valid_fraction_rows: float,
     min_valid_rows: int,
     max_train_rows: Optional[int],
     sample_weight: Optional[np.ndarray] = None,
-) -> xgb.Booster:
+) -> Any:
     n = X.shape[0]
     if max_train_rows is not None and n > max_train_rows:
         start = n - max_train_rows
@@ -871,18 +940,45 @@ def xgb_train_es(
 
     wtr = None if sample_weight is None else sample_weight[tr_idx]
     wva = None if sample_weight is None else sample_weight[va_idx]
-    dtr = xgb.DMatrix(X[tr_idx, :], label=y[tr_idx], weight=wtr)
-    dva = xgb.DMatrix(X[va_idx, :], label=y[va_idx], weight=wva)
 
-    booster = xgb.train(
-        params=params,
-        dtrain=dtr,
-        num_boost_round=int(nrounds_max),
-        evals=[(dtr, "train"), (dva, "eval")],
-        early_stopping_rounds=int(early_stopping_rounds),
-        verbose_eval=False
-    )
-    return booster
+    if backend == "xgb":
+        dtr = xgb.DMatrix(X[tr_idx, :], label=y[tr_idx], weight=wtr)
+        dva = xgb.DMatrix(X[va_idx, :], label=y[va_idx], weight=wva)
+        booster = xgb.train(
+            params=params_xgb,
+            dtrain=dtr,
+            num_boost_round=int(nrounds_max),
+            evals=[(dtr, "train"), (dva, "eval")],
+            early_stopping_rounds=int(early_stopping_rounds),
+            verbose_eval=False
+        )
+        return booster
+
+    if backend == "cat":
+        if CatBoostRegressor is None:
+            raise ImportError("catboost is required for --model_backend cat. Install with: pip install catboost")
+        p = dict(params_cat)
+        p["iterations"] = int(nrounds_max)
+        model = CatBoostRegressor(**p)
+        model.fit(
+            X[tr_idx, :], y[tr_idx],
+            sample_weight=wtr,
+            eval_set=(X[va_idx, :], y[va_idx]),
+            use_best_model=True,
+            early_stopping_rounds=int(early_stopping_rounds),
+            verbose=False,
+        )
+        return model
+
+    raise ValueError(f"Unsupported model backend: {backend}")
+
+
+def predict_regressor(model: Any, X: np.ndarray, backend: str) -> np.ndarray:
+    if backend == "xgb":
+        return np.asarray(model.predict(xgb.DMatrix(X)), dtype=float)
+    if backend == "cat":
+        return np.asarray(model.predict(X), dtype=float)
+    raise ValueError(f"Unsupported model backend: {backend}")
 
 
 # =============================================================================
@@ -931,8 +1027,6 @@ def fit_dry_decomposition_models(hourly: pd.DataFrame, daily_all: pd.DataFrame, 
 
     Xex_train = dt_train[ex_cols].to_numpy(dtype=np.float32, copy=False)
     Xsh_train = dt_train[sh_cols].to_numpy(dtype=np.float32, copy=False)
-    dmx_ex_train = xgb.DMatrix(Xex_train)
-    dmx_sh_train = xgb.DMatrix(Xsh_train)
     dt_train_dates = dt_train["date"].to_numpy()
     train_hours = dt_train["hour"].to_numpy(dtype=int)
     night_mask_train = is_wee_hour(train_hours, cfg.wee_hours_start, cfg.wee_hours_end)
@@ -961,9 +1055,11 @@ def fit_dry_decomposition_models(hourly: pd.DataFrame, daily_all: pd.DataFrame, 
 
         yex = dt_train["ex_target"].to_numpy(dtype=float)
 
-        ex_model = xgb_train_es(
+        ex_model = train_regressor_es(
             X=Xex_train, y=yex,
-            params=cfg.xgb_ex_params,
+            backend=cfg.model_backend,
+            params_xgb=cfg.xgb_ex_params,
+            params_cat=cfg.cat_ex_params,
             nrounds_max=cfg.ex_nrounds_max,
             early_stopping_rounds=cfg.early_stopping_rounds,
             valid_fraction_rows=cfg.valid_fraction_rows,
@@ -972,7 +1068,7 @@ def fit_dry_decomposition_models(hourly: pd.DataFrame, daily_all: pd.DataFrame, 
             sample_weight=w_ex,
         )
 
-        ex_pred_raw = np.maximum(0.0, ex_model.predict(dmx_ex_train))
+        ex_pred_raw = np.maximum(0.0, predict_regressor(ex_model, Xex_train, cfg.model_backend))
         dt_train["ex_pred_raw"] = ex_pred_raw
         ex_pred_mean = dt_train.groupby("date")["ex_pred_raw"].transform("mean").to_numpy(dtype=float)
         ex_pred = np.where(ex_pred_mean > 0, ex_pred_raw * (dt_train["extraneous_daily"].to_numpy(dtype=float) / ex_pred_mean), 0.0)
@@ -991,9 +1087,11 @@ def fit_dry_decomposition_models(hourly: pd.DataFrame, daily_all: pd.DataFrame, 
 
         ysh = dt_train["san_shape_obs"].to_numpy(dtype=float)
 
-        sh_model = xgb_train_es(
+        sh_model = train_regressor_es(
             X=Xsh_train, y=ysh,
-            params=cfg.xgb_sh_params,
+            backend=cfg.model_backend,
+            params_xgb=cfg.xgb_sh_params,
+            params_cat=cfg.cat_sh_params,
             nrounds_max=cfg.sh_nrounds_max,
             early_stopping_rounds=cfg.early_stopping_rounds,
             valid_fraction_rows=cfg.valid_fraction_rows,
@@ -1002,7 +1100,7 @@ def fit_dry_decomposition_models(hourly: pd.DataFrame, daily_all: pd.DataFrame, 
             sample_weight=w_sh,
         )
 
-        dt_train["s_shape"] = normalize_shape_by_day(dt_train_dates, sh_model.predict(dmx_sh_train))
+        dt_train["s_shape"] = normalize_shape_by_day(dt_train_dates, predict_regressor(sh_model, Xsh_train, cfg.model_backend))
 
         sanitary_pred = np.maximum(0.0, dt_train["sanitary_daily"].to_numpy(dtype=float) * dt_train["s_shape"].to_numpy(dtype=float))
         plant_recon = sanitary_pred + dt_train["ex_pred"].to_numpy(dtype=float)
@@ -1019,12 +1117,11 @@ def fit_dry_decomposition_models(hourly: pd.DataFrame, daily_all: pd.DataFrame, 
 
     # Holdout test
     Xsh_test = dt_test[sh_cols].to_numpy(dtype=np.float32, copy=False)
-    dmx_sh_test = xgb.DMatrix(Xsh_test)
-    dt_test["s_shape"] = normalize_shape_by_day(dt_test["date"].to_numpy(), sh_model.predict(dmx_sh_test))
+    dt_test["s_shape"] = normalize_shape_by_day(dt_test["date"].to_numpy(), predict_regressor(sh_model, Xsh_test, cfg.model_backend))
     dt_test["sanitary_pred"] = np.maximum(0.0, dt_test["sanitary_daily"].to_numpy(dtype=float) * dt_test["s_shape"].to_numpy(dtype=float))
 
     Xex_t = dt_test[ex_cols].to_numpy(dtype=np.float32, copy=False)
-    ex_raw_t = np.maximum(0.0, ex_model.predict(xgb.DMatrix(Xex_t)))
+    ex_raw_t = np.maximum(0.0, predict_regressor(ex_model, Xex_t, cfg.model_backend))
     dt_test["ex_pred_raw"] = ex_raw_t
     ex_pred_mean_t = dt_test.groupby("date")["ex_pred_raw"].transform("mean").to_numpy(dtype=float)
     dt_test["extraneous_pred"] = np.maximum(0.0, np.where(ex_pred_mean_t > 0, ex_raw_t * (dt_test["extraneous_daily"].to_numpy(dtype=float) / ex_pred_mean_t), 0.0))
@@ -1058,6 +1155,7 @@ def fit_dry_decomposition_models(hourly: pd.DataFrame, daily_all: pd.DataFrame, 
         "ex_feature_cols": ex_cols,
         "sh_feature_cols": sh_cols,
         "dry_test_metrics": {
+            "model_backend": cfg.model_backend,
             "plant_MAE": mae,
             "plant_RMSE": rmse,
             "plant_R2": r2,
@@ -1076,7 +1174,7 @@ def fit_dry_decomposition_models(hourly: pd.DataFrame, daily_all: pd.DataFrame, 
 # =============================================================================
 # 13) Apply models to all hours
 # =============================================================================
-def apply_models_all_hours(hourly: pd.DataFrame, daily_all: pd.DataFrame, daily_dry: pd.DataFrame, models: Dict[str, Any], lag_opt: int) -> pd.DataFrame:
+def apply_models_all_hours(hourly: pd.DataFrame, daily_all: pd.DataFrame, daily_dry: pd.DataFrame, models: Dict[str, Any], lag_opt: int, cfg: Config) -> pd.DataFrame:
     print("\n" + "=" * 70)
     print("13) APPLY MODELS TO ALL HOURS")
     print("=" * 70)
@@ -1094,18 +1192,18 @@ def apply_models_all_hours(hourly: pd.DataFrame, daily_all: pd.DataFrame, daily_
     feat_cols = list(dict.fromkeys(ex_cols + sh_cols))
     dt = impute_feature_cols(dt, feat_cols)
 
-    ex_model: xgb.Booster = models["ex_model"]
-    sh_model: xgb.Booster = models["sh_model"]
+    ex_model = models["ex_model"]
+    sh_model = models["sh_model"]
 
     Xsh_all = dt[sh_cols].to_numpy(dtype=np.float32, copy=False)
-    sh_raw = np.maximum(1e-9, sh_model.predict(xgb.DMatrix(Xsh_all)))
+    sh_raw = np.maximum(1e-9, predict_regressor(sh_model, Xsh_all, cfg.model_backend))
     tmp = pd.DataFrame({"date": dt["date"].to_numpy(), "raw": sh_raw})
     day_mean = tmp.groupby("date")["raw"].transform("mean").to_numpy(dtype=float)
     dt["sanitary_shape"] = sh_raw / np.maximum(1e-9, day_mean)
     dt["sanitary_hourly_pred"] = np.maximum(0.0, dt["sanitary_daily"].to_numpy(dtype=float) * dt["sanitary_shape"].to_numpy(dtype=float))
 
     Xex_all = dt[ex_cols].to_numpy(dtype=np.float32, copy=False)
-    ex_raw = np.maximum(0.0, ex_model.predict(xgb.DMatrix(Xex_all)))
+    ex_raw = np.maximum(0.0, predict_regressor(ex_model, Xex_all, cfg.model_backend))
     dt["extraneous_baseline_raw"] = ex_raw
     dt["extraneous_hourly_pred"] = ex_raw.astype(np.float64, copy=True)
 
@@ -1342,6 +1440,7 @@ def export_excel(out_dir: str, dt_final: pd.DataFrame, daily_all: pd.DataFrame, 
     summary = pd.DataFrame([
         ("run_timestamp", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
         ("seed", cfg.seed),
+        ("model_backend", cfg.model_backend),
         ("tz", cfg.tz),
         ("usage_units", cfg.usage_units),
         ("tidal_lag_hours", lag_opt),
@@ -1382,6 +1481,7 @@ def save_model_bundle(out_dir: str, cfg: Config, lag_opt: int, rf_table: pd.Data
     bundle = {
         "config": {
             "seed": cfg.seed,
+            "model_backend": cfg.model_backend,
             "tz": cfg.tz,
             "usage_units": cfg.usage_units,
             "rf_bounds_primary": cfg.rf_bounds_primary,
@@ -1408,6 +1508,8 @@ def save_model_bundle(out_dir: str, cfg: Config, lag_opt: int, rf_table: pd.Data
             "max_train_rows": cfg.max_train_rows,
             "xgb_ex_params": cfg.xgb_ex_params,
             "xgb_sh_params": cfg.xgb_sh_params,
+            "cat_ex_params": cfg.cat_ex_params,
+            "cat_sh_params": cfg.cat_sh_params,
         },
         "tidal_lag_hours": int(lag_opt),
         "return_factor_seasonal": rf_table.copy(),
@@ -1437,11 +1539,13 @@ def save_model_bundle(out_dir: str, cfg: Config, lag_opt: int, rf_table: pd.Data
 # =============================================================================
 def main(cfg: Config):
     np.random.seed(cfg.seed)
+    t0 = datetime.now()
 
     prog = Progress(total_steps=12)
 
     out = init_output_dirs(cfg)
     out_dir = out["out_dir"]
+    run_ts = out["run_ts"]
     prog.tick("Initialized output dirs")
 
     print("=" * 70)
@@ -1478,7 +1582,7 @@ def main(cfg: Config):
     models = fit_dry_decomposition_models(hourly, daily_all, daily_dry, lag_opt, cfg)
     prog.tick("Trained dry decomposition models")
 
-    dt_final = apply_models_all_hours(hourly, daily_all, daily_dry, models, lag_opt)
+    dt_final = apply_models_all_hours(hourly, daily_all, daily_dry, models, lag_opt, cfg)
     prog.tick("Applied models to all hours")
 
     tests = {
@@ -1498,6 +1602,8 @@ def main(cfg: Config):
 
     export_excel(out_dir, dt_final, daily_all, daily_dry, rf_table, models, gw_daily, lag_opt, tests, cfg)
     save_model_bundle(out_dir, cfg, lag_opt, rf_table, models, gw_daily)
+    elapsed_sec = (datetime.now() - t0).total_seconds()
+    append_experiment_log(cfg, out_dir, run_ts, elapsed_sec, models)
     prog.tick("Exported Excel + saved model bundle")
 
     print("\nCOMPLETE\nOutputs in:\n ", out_dir)
@@ -1512,6 +1618,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--results_parent_dir", default=None, help="Parent output folder")
     p.add_argument("--tz", default="UTC")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--model_backend", default="xgb", help="xgb | cat")
     p.add_argument("--usage_units", default="AUTO", help="AUTO | MGD | MG")
     p.add_argument("--plots", type=int, default=1, help="1 enable plots, 0 disable")
     p.add_argument("--fast", type=int, default=1, help="1 enable faster training mode (default), 0 for full mode")
@@ -1537,6 +1644,9 @@ if __name__ == "__main__":
     if args.tz:
         cfg.tz = args.tz
     cfg.seed = int(args.seed)
+    cfg.model_backend = str(args.model_backend).strip().lower()
+    if cfg.model_backend not in {"xgb", "cat"}:
+        raise ValueError("--model_backend must be one of: xgb, cat")
     cfg.usage_units = str(args.usage_units).upper().strip()
     if cfg.usage_units not in {"AUTO", "MGD", "MG"}:
         raise ValueError("usage_units must be one of: AUTO, MGD, MG")
@@ -1593,5 +1703,9 @@ if __name__ == "__main__":
     cfg.xgb_sh_params["seed"] = cfg.seed
     cfg.xgb_ex_params["nthread"] = cfg.xgb_nthread
     cfg.xgb_sh_params["nthread"] = cfg.xgb_nthread
+    cfg.cat_ex_params["random_seed"] = cfg.seed
+    cfg.cat_sh_params["random_seed"] = cfg.seed
+    cfg.cat_ex_params["thread_count"] = cfg.xgb_nthread
+    cfg.cat_sh_params["thread_count"] = cfg.xgb_nthread
 
     main(cfg)
