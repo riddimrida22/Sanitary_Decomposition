@@ -1013,7 +1013,7 @@ def apply_models_all_hours(hourly: pd.DataFrame, daily_all: pd.DataFrame, daily_
 
     ex_raw = np.maximum(0.0, ex_model.predict(xgb.DMatrix(dt[ex_cols].to_numpy(dtype=float))))
     dt["extraneous_baseline_raw"] = ex_raw
-    dt["extraneous_hourly_pred"] = ex_raw.copy()
+    dt["extraneous_hourly_pred"] = ex_raw.astype(np.float64, copy=True)
 
     # Scale to match daily extraneous on dry days.
     mask = (dt["is_dry"]) & dt["extraneous_daily"].notna()
