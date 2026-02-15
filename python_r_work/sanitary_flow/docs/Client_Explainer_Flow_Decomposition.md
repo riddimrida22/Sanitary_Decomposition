@@ -41,6 +41,50 @@ Why this matters:
 
 ---
 
+## How daily usage is converted to hourly sanitary flow
+This is one of the most important parts of the method.
+
+The challenge:
+- Water usage data are daily totals.
+- Plant flow data are hourly.
+- So the model must convert one daily sanitary value into a realistic 24-hour sanitary pattern.
+
+The process is:
+
+1. Build an adjusted daily usage signal  
+The model first applies travel-time lag to daily usage (same-day + previous-day blend) so usage timing better matches plant timing.
+
+2. Convert adjusted usage into daily sanitary flow  
+For each season (DJF/MAM/JJA/SON), the model estimates a seasonal RF (return factor).  
+Then:
+- `sanitary_daily = RF × adjusted_daily_usage`
+
+This gives one sanitary flow level per day.
+
+3. Learn an hourly shape factor from dry periods  
+On dry days, the model learns an hourly “shape” (for example low overnight, higher in daytime peaks).  
+This shape is called `s_shape`.
+
+4. Force hourly shape to conserve daily total  
+The learned hourly shape is normalized so its daily average is 1.0.  
+That means when hourly values are summed/averaged over the day, they still match `sanitary_daily`.
+
+5. Allocate daily sanitary total into 24 hours  
+The final hourly sanitary estimate is:
+- `sanitary_hourly_pred = sanitary_daily × sanitary_shape`
+
+Because shape is normalized daily, this allocation preserves the daily sanitary volume while giving realistic hourly variation.
+
+6. Compute extraneous flow from remaining share  
+After sanitary is allocated hourly, the remaining flow needed to match plant observations is assigned to extraneous flow.
+
+Why this matters for clients:
+- It prevents “double counting” or drifting totals.
+- It allows daily customer-use information to drive hourly decomposition without inventing extra volume.
+- It keeps hourly sanitary patterns realistic while staying consistent with daily mass balance.
+
+---
+
 ## How rain response lag is handled (dry vs wet classification)
 Rain does not always affect plant flow immediately.  
 The code checks for rain events and then looks ahead in a lag window (default roughly 12 to 24 hours) to see if plant flow rises enough.
